@@ -6,13 +6,63 @@ program tmoe_bench;
 {$mode objfpc}{$H+}
 
 uses SysUtils, BaseUnix, Unix, tmoe_config, tmoe_tensor, tmoe_params, tmoe_ternary, tmoe_gemv,
-  tmoe_model, tmoe_moe, tmoe_kvcache, tmoe_cuda, tmoe_args;
+  tmoe_model, tmoe_moe, tmoe_kvcache, tmoe_cuda, tmoe_account, tmoe_args;
 
 function Clock: Double;
 var Tv: TTimeVal;
 begin
   fpgettimeofday(@Tv, nil);
   Result := Tv.tv_sec + Tv.tv_usec * 1e-6;
+end;
+
+procedure WriteOneAccount(Mm, Nn, Kk: Integer);
+var A: TGemmAccount;
+begin
+  A := AccountGemm(Mm, Nn, Kk);
+  if not A.Valid then Exit;
+  WriteLn(Format('account M=%-4d N=%-4d K=%-4d  issued %d B (w %d a %d s %d)  naive %d B  weight x%.1f  dp4a %d',
+    [Mm, Nn, Kk, A.Total, A.Weight, A.Act, A.Scale, A.NaiveTotal,
+     A.NaiveWeight / A.Weight, A.Dp4aIssued]));
+end;
+
+procedure WriteAccounts;
+begin
+  WriteLn('static GEMM account (global loads the kernel issues; not DRAM bytes, not cycles):');
+  WriteOneAccount(1, 256, 128);
+  WriteOneAccount(32, 256, 128);
+  WriteOneAccount(32, 1024, 512);
+  WriteOneAccount(33, 65, 128);
+  WriteOneAccount(1, 4096, 4096);
+end;
+
+procedure WriteGpuGemm(const Gpu: string);
+const
+  // M, N, K. Warmup launches are outside the CUDA event.
+  Sh: array[0..4, 0..2] of Integer = (
+    (1, 256, 128), (32, 256, 128), (32, 1024, 512), (33, 65, 128), (1, 4096, 4096));
+var
+  I, Wup, Iters, Rc: Integer;
+  Tiled, Naive: Double;
+begin
+  Wup := ArgInt('warmup', 10);
+  Iters := ArgInt('iters', 50);
+  WriteLn(Format('gpu %s GEMM  CUDA events, warmup %d, iters %d', [Gpu, Wup, Iters]));
+  for I := 0 to High(Sh) do
+  begin
+    Rc := Cuda.BenchGemm(Sh[I, 0], Sh[I, 1], Sh[I, 2], Wup, Iters, 0, @Tiled);
+    if Rc <> 0 then
+    begin
+      WriteLn('  tiled failed: ', CudaError);
+      Continue;
+    end;
+    Rc := Cuda.BenchGemm(Sh[I, 0], Sh[I, 1], Sh[I, 2], Wup, Iters, 1, @Naive);
+    if Rc <> 0 then
+      WriteLn(Format('  M=%d N=%d K=%d  tiled %.2f us  naive FAILED %s',
+        [Sh[I, 0], Sh[I, 1], Sh[I, 2], Tiled, CudaError]))
+    else
+      WriteLn(Format('  M=%d N=%d K=%d  tiled %.2f us  naive %.2f us',
+        [Sh[I, 0], Sh[I, 1], Sh[I, 2], Tiled, Naive]));
+  end;
 end;
 
 var
@@ -37,6 +87,7 @@ begin
   Decode := ArgInt('decode', 64);
   Reps := ArgInt('reps', 5);
   if Prefill + Decode > C.MaxSeq then Decode := C.MaxSeq - Prefill;
+  if not HasFlag('cpu') then MoeSetDevice(True);
   BuildLayout(S, C);
   InitParams(S, 1);
   BuildModel(M, S);
@@ -45,6 +96,7 @@ begin
   for I := 0 to Prefill - 1 do Tok[I] := (I * 31 + 7) mod C.Vocab;
   SetLength(Logits, C.Vocab);
   WriteLn(ConfigSummary(C));
+  WriteLn('routed experts: ', MoeDeviceStatus);
   WriteLn(Format('parameters            %d', [S.Total]));
   WriteLn(Format('resident weights      %d bytes (%.2f MiB)', [ResidentWeightBytes(M), ResidentWeightBytes(M) / 1048576]));
   WriteLn(Format('weight bytes / token  %d (%.2f MiB)', [WeightBytesPerToken(M), WeightBytesPerToken(M) / 1048576]));
@@ -101,11 +153,24 @@ begin
   if CudaAvailable(Why) then
   begin
     Gpu := CudaDeviceName;
+    if Assigned(Cuda.DeviceInfo) then
+    begin
+      SetLength(Why, 512);
+      if Cuda.DeviceInfo(0, PChar(Why), Length(Why)) = 0 then
+        WriteLn('gpu info: ', PChar(Why));
+    end;
     if Cuda.BenchGemv(4096, 4096, 200, @Us) = 0 then
-      WriteLn(Format('gpu %s ternary GEMV 4096x4096  %.2f us', [Gpu, Us]))
+      WriteLn(Format('gpu %s ternary GEMV 4096x4096  %.2f us  (CUDA events, 1 warmup inside the wrapper, 200 iters)',
+        [Gpu, Us]))
     else
-      WriteLn('gpu bench failed: ', CudaError);
+      WriteLn('gpu gemv bench failed: ', CudaError);
   end
   else
-    WriteLn('gpu: ', Why);
+    WriteLn('gpu: ', Why, '  (no CUDA event timings were taken)');
+
+  WriteAccounts;
+  if CudaAvailable(Why) and Assigned(Cuda.BenchGemm) then
+    WriteGpuGemm(CudaDeviceName)
+  else if CudaAvailable(Why) then
+    WriteLn('gpu gemm bench: library has no tmoe_h_bench_gemm');
 end.

@@ -33,7 +33,7 @@ function Fnv1a64(P: PByte; N: PtrInt): QWord;
 
 implementation
 
-uses Classes, SysUtils;
+uses Classes, SysUtils, tmoe_moe;
 
 const
   MAGIC: array[0..7] of Char = 'TMOECKP1';
@@ -211,6 +211,8 @@ begin
   I := 0;
   for L := 0 to M.Cfg.Layers - 1 do
   begin
+    // Bits are about to change; drop a device copy so the next forward reloads.
+    MoeReleaseDevice(M.Layers[L].Moe);
     for E := 0 to M.Cfg.Experts - 1 do begin M.Layers[L].Moe.ExGate[E] := P[I]; Inc(I); end;
     for E := 0 to M.Cfg.Experts - 1 do begin M.Layers[L].Moe.ExUp[E] := P[I]; Inc(I); end;
     for E := 0 to M.Cfg.Experts - 1 do begin M.Layers[L].Moe.ExDown[E] := P[I]; Inc(I); end;

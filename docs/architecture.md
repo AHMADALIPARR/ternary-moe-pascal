@@ -40,9 +40,15 @@ second choice, and within a choice rank tokens go in order. A dropped slot
 contributes nothing; the shared expert still runs. `CapacityFactor <= 0` turns
 the limit off.
 
-Load-balance loss (Switch Transformer): `aux = AuxCoef * E * sum_e f_e * P_e`,
-where `f_e` is the fraction of slots routed to `e` and `P_e` the mean router
-probability. Perfect balance gives `AuxCoef`, full collapse `AuxCoef * E`.
+Load-balance loss: `aux = AuxCoef * E * sum_e f_e * P_e`. For top-1, `f_e` is
+the fraction of tokens whose argmax is `e` **before** capacity drops, and
+`P_e` is the mean router probability. That is the Switch Transformer formula
+(Fedus, Zoph, Shazeer, arXiv:2101.03961). `f` is a stop-gradient. Perfect
+balance gives `AuxCoef`; a collapsed argmax and a collapsed probability both
+give `AuxCoef * E`. Top-k > 1 uses the same algebra on the fraction of
+selected slots, which is not the published top-1 formula. The post-drop kept
+fraction is recorded and is not what the loss uses. See
+[routing.md](routing.md).
 
 ## Configurations
 

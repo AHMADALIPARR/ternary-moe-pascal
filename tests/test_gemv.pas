@@ -16,6 +16,7 @@ var
   Xq: TShortArray;
   Xf, Xs, Y, Y2, Dq: TSingleArray;
   Yd: array of Double;
+  C: Integer;
   Sums: TIntArray;
   S, R, B, I, T, Bad, NB: Integer;
   Err, Rel: Double;
@@ -85,8 +86,60 @@ begin
     DequantTernary(M, @Dq[0]);
     MatVec(@Dq[0], M.Rows, M.Cols, @Xf[0], @Y2[0]);
     Err := MaxAbsDiff(@Y[0], @Y2[0], M.Rows);
-    Check(Err < 1e-4, Format('f32 GEMV vs dequant matvec, max diff %.2e', [Err]));
+      Check(Err < 1e-4, Format('f32 GEMV vs dequant matvec, max diff %.2e', [Err]));
   end;
+
+  Section('tails, code 11, zero scale');
+  // Tile is 32 x 64 in the CUDA kernel. These shapes cross that boundary
+  // on the CPU reference, which the GPU test compares against.
+  for S := 0 to 4 do
+  begin
+    case S of
+      0: begin R := 1; C := 128; end;
+      1: begin R := 33; C := 128; end;
+      2: begin R := 65; C := 256; end;
+      3: begin R := 31; C := 384; end;
+      4: begin R := 64; C := 128; end;
+    else
+      begin R := 1; C := 128; end;
+    end;
+    RandomTernary(Rng, R, C, False, M);
+    T := 33;
+    SetLength(Xq, T * M.Cols); SetLength(Xs, T);
+    RandomInt8(Rng, T * M.Cols, @Xq[0]);
+    for I := 0 to T - 1 do Xs[I] := 0.02 * (I - 16);
+    SetLength(Y, T * M.Rows); SetLength(Yd, T * M.Rows);
+    TernaryGemmInt8(M, T, @Xq[0], @Xs[0], @Y[0]);
+    Bad := 0; Err := 0;
+    for I := 0 to T - 1 do
+    begin
+      NaiveGemv(M, @Xq[I * M.Cols], Xs[I], @Yd[0]);
+      for B := 0 to M.Rows - 1 do
+        Err := Max(Err, Abs(Y[I * M.Rows + B] - Yd[B]));
+    end;
+    Check(Err < 1e-4, Format('GEMM %dx%d T=%d vs naive double, max diff %.2e',
+      [R, C, T, Err]));
+  end;
+  RandomTernary(Rng, 8, 128, True, M);
+  M.Bits[0] := $FF;
+  SetLength(Xq, 128); SetLength(Y, 8); SetLength(Yd, 8);
+  for I := 0 to 127 do Xq[I] := 7;
+  TernaryGemvInt8(M, @Xq[0], 1, @Y[0]);
+  NaiveGemv(M, @Xq[0], 1, @Yd[0]);
+  Err := 0;
+  for I := 0 to 7 do Err := Max(Err, Abs(Y[I] - Yd[I]));
+  Check((Err < 1e-6) and (Y[0] = Yd[0]), Format('code 11 GEMV matches naive (diff %.2e)', [Err]));
+  for I := 0 to High(M.Scales) do M.Scales[I] := 0;
+  TernaryGemvInt8(M, @Xq[0], 3, @Y[0]);
+  Bad := 0;
+  for I := 0 to 7 do if Y[I] <> 0 then Inc(Bad);
+  Check(Bad = 0, 'zero scales produce a zero row');
+  Xs[0] := 0;
+  for I := 0 to High(M.Scales) do M.Scales[I] := 1;
+  TernaryGemvInt8(M, @Xq[0], 0, @Y[0]);
+  Bad := 0;
+  for I := 0 to 7 do if Y[I] <> 0 then Inc(Bad);
+  Check(Bad = 0, 'zero activation scale produces a zero row');
 
   Section('int8 quant');
   SetLength(Xf, 256); SetLength(Xq, 256);

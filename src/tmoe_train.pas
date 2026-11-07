@@ -114,10 +114,8 @@ begin
 end;
 
 function SiluGrad(G: Single): Single; inline;
-var S: Single;
 begin
-  S := Sigmoid(G);
-  Result := S * (1 + G * (1 - S));
+  Result := SiluDx(G);
 end;
 
 procedure Zeros(var A: TSingleArray; N: PtrInt);

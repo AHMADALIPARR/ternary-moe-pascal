@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SnapKitty-Opaque-1.0
 // Copyright (C) 2026 Ahmad Ali Parr / SnapKitty Research Lab
 // Ternary MoE kernels: int8 act quant, dp4a GEMV, tiled GEMM, grouped expert GEMM.
+//
+// sm_87 (Jetson Orin) is Ampere. The shipped gencode list is sm_80 and up
+// (see the Makefile); NVIDIA Pascal (sm_61) is not a target. "Pascal" in the
+// repo name is Free Pascal. dp4a is a CUDA-core instruction (sm_61+). This
+// file does not emit mma.sync: sm_87 tensor cores do INT8/INT4/FP16/BF16/TF32,
+// not a ternary {-1,0,+1} type, and expanding 2-bit codes to those layouts
+// does not shrink the packed global load. See docs/orin-gemm.md.
 #include "tmoe_cuda.h"
 
 #include <cuda_runtime.h>
@@ -207,18 +214,28 @@ __global__ void __launch_bounds__(256) ternary_gemm_kernel(
       sx[r][c4 * 4 + 2] = v.z;
       sx[r][c4 * 4 + 3] = v.w;
     }
-    // weights: BN rows x 32 packed bytes = 512 u32, two per thread, 4 words out each
+    // Weights: BN rows x 32 packed bytes. 128 threads each issue one 16-byte
+    // load (two per row). A row is 32 bytes, so the pair fills one 32-byte
+    // sector. Consecutive rows are K/4 bytes apart and do not coalesce with
+    // each other unless K = 128. Threads 128..255 do not load; every row is
+    // covered by tid 0..127. Tail rows (n0+r >= n) store zeros and are not read.
+    if (tid < BN * 2) {
+      const int r = tid >> 1;
+      const int part = tid & 1;
+      uint4 p = make_uint4(0, 0, 0, 0);
+      if (n0 + r < n) {
+        const uint8_t* rowp = w + (size_t)(n0 + r) * (k >> 2) + (size_t)kb * (TMOE_BLOCK / 4);
+        p = __ldg(reinterpret_cast<const uint4*>(rowp) + part);
+      }
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
-      const int idx = tid + h * 256;
-      const int r = idx >> 3, c = idx & 7;
-      uint32_t p = 0;
-      if (n0 + r < n)
-        p = __ldg((const uint32_t*)(w + (size_t)(n0 + r) * (k >> 2) + kb * (TMOE_BLOCK / 4)) + c);
-      sw[r][c * 4 + 0] = lut[p & 0xFF];
-      sw[r][c * 4 + 1] = lut[(p >> 8) & 0xFF];
-      sw[r][c * 4 + 2] = lut[(p >> 16) & 0xFF];
-      sw[r][c * 4 + 3] = lut[p >> 24];
+      for (int t = 0; t < 4; ++t) {
+        const uint32_t u = (t == 0) ? p.x : (t == 1) ? p.y : (t == 2) ? p.z : p.w;
+        const int c = part * 4 + t;
+        sw[r][c * 4 + 0] = lut[u & 0xFF];
+        sw[r][c * 4 + 1] = lut[(u >> 8) & 0xFF];
+        sw[r][c * 4 + 2] = lut[(u >> 16) & 0xFF];
+        sw[r][c * 4 + 3] = lut[u >> 24];
+      }
     }
     __syncthreads();
     int is[2][4];
@@ -258,6 +275,47 @@ __global__ void __launch_bounds__(256) ternary_gemm_kernel(
       if (col < n) y[(size_t)orow * n + col] = acc[i][j] * xsc;
     }
   }
+}
+
+// One warp per output row per token. Same int32 block sums as the tiled GEMM,
+// but every token reloads its weight rows from global memory. Single launch
+// so a bench can compare tiling against issue scope, not against launch count.
+#define NAIVE_WARPS 4
+__global__ void __launch_bounds__(NAIVE_WARPS * 32) ternary_gemm_naive_kernel(
+    const uint8_t* __restrict__ w, const float* __restrict__ ws, int n, int k,
+    const int8_t* __restrict__ xq, const float* __restrict__ xs, int m, float* __restrict__ y) {
+  __shared__ int lut[256];
+  build_lut(lut);
+  __syncthreads();
+  const int lane = threadIdx.x & 31;
+  const int row = blockIdx.x * NAIVE_WARPS + (threadIdx.x >> 5);
+  const int tok = (int)blockIdx.y;
+  if (row >= n || tok >= m) return;
+  const int words = k >> 4;
+  const int nb = k / TMOE_BLOCK;
+  const uint32_t* wr = (const uint32_t*)(w + (size_t)row * (k >> 2));
+  const int4* xv = (const int4*)(xq + (size_t)tok * k);
+  const float* sr = ws + (size_t)row * nb;
+  float acc = 0.f;
+  for (int base = 0; base < words; base += 32) {
+    int wi = base + lane;
+    int s = 0;
+    if (wi < words) {
+      uint32_t p = __ldg(wr + wi);
+      int4 a = __ldg(xv + wi);
+      s = dot4(lut[p & 0xFF], a.x, s);
+      s = dot4(lut[(p >> 8) & 0xFF], a.y, s);
+      s = dot4(lut[(p >> 16) & 0xFF], a.z, s);
+      s = dot4(lut[p >> 24], a.w, s);
+    }
+    s += __shfl_xor_sync(0xffffffffu, s, 1);
+    s += __shfl_xor_sync(0xffffffffu, s, 2);
+    s += __shfl_xor_sync(0xffffffffu, s, 4);
+    if ((lane & 7) == 0 && wi < words) acc += (float)s * __ldg(sr + (wi >> 3));
+  }
+  acc += __shfl_xor_sync(0xffffffffu, acc, 8);
+  acc += __shfl_xor_sync(0xffffffffu, acc, 16);
+  if (lane == 0) y[(size_t)tok * n + row] = acc * xs[tok];
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -326,6 +384,21 @@ int tmoe_cuda_device_name(int dev, char* buf, int len) {
   return 0;
 }
 
+int tmoe_cuda_device_info(int dev, char* buf, int len) {
+  cudaDeviceProp p;
+  CK(cudaGetDeviceProperties(&p, dev));
+  // clockRate / memoryClockRate are the driver's current values, not a
+  // datasheet maximum. On Jetson they follow the active nvpmodel.
+  snprintf(buf, len,
+           "%s sm_%d%d sms=%d warps_per_sm=%d regs_per_sm=%d smem_per_sm=%zu "
+           "smem_per_block_optin=%zu l2=%d bus_bits=%d clock_khz=%d mem_clock_khz=%d",
+           p.name, p.major, p.minor, p.multiProcessorCount,
+           p.maxThreadsPerMultiProcessor / 32, p.regsPerMultiprocessor,
+           p.sharedMemPerMultiprocessor, p.sharedMemPerBlockOptin, p.l2CacheSize,
+           p.memoryBusWidth, p.clockRate, p.memoryClockRate);
+  return 0;
+}
+
 const char* tmoe_cuda_last_error(void) { return g_err; }
 int tmoe_cuda_malloc(void** ptr, size_t bytes) { CK(cudaMalloc(ptr, bytes)); return 0; }
 int tmoe_cuda_free(void* ptr) { CK(cudaFree(ptr)); return 0; }
@@ -352,9 +425,21 @@ int tmoe_ternary_gemm(const uint8_t* w, const float* ws, int n, int k, const int
                       const float* xs, int m, float* y) {
   if (k % TMOE_BLOCK) return set_msg("k must be a multiple of 128");
   if (m <= 0) return 0;
+  if (m > 65535) return set_msg("m exceeds CUDA grid limit");
   dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM, 1);
   ternary_gemm_kernel<false><<<grid, 256>>>(w, ws, n, k, xq, xs, m, y, nullptr, nullptr, nullptr, 0, 1);
   CKL("ternary_gemm_kernel");
+  return 0;
+}
+
+int tmoe_ternary_gemm_naive(const uint8_t* w, const float* ws, int n, int k, const int8_t* xq,
+                            const float* xs, int m, float* y) {
+  if (k % TMOE_BLOCK) return set_msg("k must be a multiple of 128");
+  if (m <= 0) return 0;
+  if (m > 65535) return set_msg("m exceeds CUDA grid limit");
+  dim3 grid((n + NAIVE_WARPS - 1) / NAIVE_WARPS, m, 1);
+  ternary_gemm_naive_kernel<<<grid, NAIVE_WARPS * 32>>>(w, ws, n, k, xq, xs, m, y);
+  CKL("ternary_gemm_naive_kernel");
   return 0;
 }
 
@@ -529,6 +614,20 @@ int tmoe_h_moe_routed_forward(const float* x, int T, int D, int H, int E, int K,
   return 0;
 }
 
+int tmoe_h_ternary_gemm_naive(const uint8_t* w, const float* ws, int n, int k, const int8_t* xq,
+                                const float* xs, int m, float* y) {
+  DevBuf b;
+  const uint8_t* dw = b.up(w, (size_t)n * k / 4); NN(dw);
+  const float* dws = b.up(ws, (size_t)n * (k / TMOE_BLOCK)); NN(dws);
+  const int8_t* dx = b.up(xq, (size_t)m * k); NN(dx);
+  const float* dxs = b.up(xs, m); NN(dxs);
+  float* dy = b.zeros<float>((size_t)m * n); NN(dy);
+  int r = tmoe_ternary_gemm_naive(dw, dws, n, k, dx, dxs, m, dy);
+  if (r) return r;
+  CK(cudaMemcpy(y, dy, sizeof(float) * m * n, cudaMemcpyDeviceToHost));
+  return 0;
+}
+
 int tmoe_h_bench_gemv(int n, int k, int iters, double* us) {
   if (k % TMOE_BLOCK) return set_msg("k must be a multiple of 128");
   DevBuf b;
@@ -558,6 +657,163 @@ int tmoe_h_bench_gemv(int n, int k, int iters, double* us) {
   cudaEventDestroy(a);
   cudaEventDestroy(z);
   *us = 1000.0 * ms / (iters > 0 ? iters : 1);
+  return 0;
+}
+
+int tmoe_h_bench_gemm(int m, int n, int k, int warmup, int iters, int kind, double* us) {
+  if (k % TMOE_BLOCK) return set_msg("k must be a multiple of 128");
+  if (m <= 0 || n <= 0) return set_msg("m and n must be positive");
+  if (kind != 0 && kind != 1) return set_msg("bench kind must be 0 (tiled) or 1 (naive)");
+  if (warmup < 0 || iters <= 0) return set_msg("warmup >= 0 and iters > 0");
+  DevBuf b;
+  std::vector<uint8_t> w((size_t)n * k / 4);
+  uint32_t rng = 12345u;
+  for (auto& v : w) {
+    uint8_t packed = 0;
+    for (int i = 0; i < 4; ++i) {
+      rng = rng * 1664525u + 1013904223u;
+      packed = (uint8_t)(packed | ((rng % 3u) << (2 * i)));
+    }
+    v = packed;
+  }
+  std::vector<float> ws((size_t)n * (k / TMOE_BLOCK), 0.01f);
+  std::vector<int8_t> x((size_t)m * k);
+  for (auto& v : x) {
+    rng = rng * 1664525u + 1013904223u;
+    v = (int8_t)((int)(rng >> 24) - 128);
+  }
+  std::vector<float> xs(m, 0.02f);
+  const uint8_t* dw = b.up(w.data(), w.size()); NN(dw);
+  const float* dws = b.up(ws.data(), ws.size()); NN(dws);
+  const int8_t* dx = b.up(x.data(), x.size()); NN(dx);
+  const float* dxs = b.up(xs.data(), xs.size()); NN(dxs);
+  float* dy = b.zeros<float>((size_t)m * n); NN(dy);
+  auto launch = [&]() {
+    if (kind == 0) {
+      dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM, 1);
+      ternary_gemm_kernel<false><<<grid, 256>>>(dw, dws, n, k, dx, dxs, m, dy, nullptr, nullptr, nullptr, 0, 1);
+    } else {
+      dim3 grid((n + NAIVE_WARPS - 1) / NAIVE_WARPS, m, 1);
+      ternary_gemm_naive_kernel<<<grid, NAIVE_WARPS * 32>>>(dw, dws, n, k, dx, dxs, m, dy);
+    }
+  };
+  for (int i = 0; i < warmup; ++i) launch();
+  CK(cudaDeviceSynchronize());
+  CKL("bench warmup");
+  cudaEvent_t a, z;
+  CK(cudaEventCreate(&a));
+  CK(cudaEventCreate(&z));
+  CK(cudaEventRecord(a));
+  for (int i = 0; i < iters; ++i) launch();
+  CK(cudaEventRecord(z));
+  CK(cudaEventSynchronize(z));
+  CKL("bench iters");
+  float ms = 0.f;
+  CK(cudaEventElapsedTime(&ms, a, z));
+  cudaEventDestroy(a);
+  cudaEventDestroy(z);
+  *us = 1000.0 * (double)ms / iters;
+  return 0;
+}
+
+}  // extern "C"
+
+struct tmoe_resident {
+  int experts, dim, hidden;
+  uint8_t *wg, *wu, *wd;
+  float *sg, *su, *sd;
+  float *x, *y, *gate;
+  int* se;
+  char* ws;
+  size_t x_cap, y_cap, gate_cap, se_cap, ws_cap;
+};
+
+static int grow_buf(void** p, size_t* cap, size_t bytes) {
+  if (*cap >= bytes) return 0;
+  cudaFree(*p);
+  *p = nullptr;
+  *cap = 0;
+  cudaError_t e = cudaMalloc(p, bytes ? bytes : 1);
+  if (e != cudaSuccess) *p = nullptr;
+  if (e != cudaSuccess) return set_err("cudaMalloc", e);
+  *cap = bytes ? bytes : 1;
+  return 0;
+}
+
+static int upload_buf(void** p, const void* src, size_t bytes) {
+  *p = nullptr;
+  cudaError_t e = cudaMalloc(p, bytes ? bytes : 1);
+  if (e != cudaSuccess) return set_err("cudaMalloc", e);
+  if (!bytes || !src) return 0;
+  e = cudaMemcpy(*p, src, bytes, cudaMemcpyHostToDevice);
+  if (e != cudaSuccess) return set_err("cudaMemcpy", e);
+  return 0;
+}
+
+extern "C" {
+
+void tmoe_resident_destroy(tmoe_resident* r) {
+  if (!r) return;
+  cudaFree(r->wg); cudaFree(r->wu); cudaFree(r->wd);
+  cudaFree(r->sg); cudaFree(r->su); cudaFree(r->sd);
+  cudaFree(r->x); cudaFree(r->y); cudaFree(r->gate);
+  cudaFree(r->se); cudaFree(r->ws);
+  delete r;
+  cudaGetLastError();
+}
+
+int tmoe_resident_create(tmoe_resident** out, int experts, int dim, int hidden,
+                         const uint8_t* wg, const float* sg, const uint8_t* wu, const float* su,
+                         const uint8_t* wd, const float* sd) {
+  if (!out) return set_msg("null resident");
+  *out = nullptr;
+  if (dim % TMOE_BLOCK || hidden % TMOE_BLOCK)
+    return set_msg("dim and hidden must be multiples of 128");
+  if (experts <= 0 || experts > 1024) return set_msg("experts out of range");
+  tmoe_resident* r = new tmoe_resident();
+  memset(r, 0, sizeof(*r));
+  r->experts = experts;
+  r->dim = dim;
+  r->hidden = hidden;
+  const size_t gbytes = (size_t)experts * hidden * (size_t)dim / 4;
+  const size_t gs = (size_t)experts * hidden * (size_t)(dim / TMOE_BLOCK) * sizeof(float);
+  const size_t dbytes = (size_t)experts * dim * (size_t)hidden / 4;
+  const size_t ds = (size_t)experts * dim * (size_t)(hidden / TMOE_BLOCK) * sizeof(float);
+  int rc = 0;
+  if ((rc = upload_buf((void**)&r->wg, wg, gbytes)) ||
+      (rc = upload_buf((void**)&r->sg, sg, gs)) ||
+      (rc = upload_buf((void**)&r->wu, wu, gbytes)) ||
+      (rc = upload_buf((void**)&r->su, su, gs)) ||
+      (rc = upload_buf((void**)&r->wd, wd, dbytes)) ||
+      (rc = upload_buf((void**)&r->sd, sd, ds))) {
+    tmoe_resident_destroy(r);
+    return rc;
+  }
+  *out = r;
+  return 0;
+}
+
+int tmoe_resident_forward(tmoe_resident* r, const float* x, int tokens, int topk,
+                          const int* slot_expert, const float* slot_gate, float* y) {
+  if (!r) return set_msg("null resident");
+  if (tokens <= 0) return 0;
+  if (topk <= 0) return set_msg("topk must be positive");
+  const size_t S = (size_t)tokens * topk;
+  int rc;
+  if ((rc = grow_buf((void**)&r->x, &r->x_cap, sizeof(float) * (size_t)tokens * r->dim))) return rc;
+  if ((rc = grow_buf((void**)&r->y, &r->y_cap, sizeof(float) * (size_t)tokens * r->dim))) return rc;
+  if ((rc = grow_buf((void**)&r->gate, &r->gate_cap, sizeof(float) * S))) return rc;
+  if ((rc = grow_buf((void**)&r->se, &r->se_cap, sizeof(int) * S))) return rc;
+  const size_t need = tmoe_moe_workspace_bytes(tokens, r->dim, r->hidden, r->experts, topk);
+  if ((rc = grow_buf((void**)&r->ws, &r->ws_cap, need))) return rc;
+  CK(cudaMemcpy(r->x, x, sizeof(float) * (size_t)tokens * r->dim, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(r->y, y, sizeof(float) * (size_t)tokens * r->dim, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(r->gate, slot_gate, sizeof(float) * S, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(r->se, slot_expert, sizeof(int) * S, cudaMemcpyHostToDevice));
+  rc = tmoe_moe_routed_forward(r->x, tokens, r->dim, r->hidden, r->experts, topk, r->se, r->gate,
+                               r->wg, r->sg, r->wu, r->su, r->wd, r->sd, r->y, r->ws);
+  if (rc) return rc;
+  CK(cudaMemcpy(y, r->y, sizeof(float) * (size_t)tokens * r->dim, cudaMemcpyDeviceToHost));
   return 0;
 }
 

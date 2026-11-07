@@ -18,18 +18,32 @@ type
   TCudaMoe = function(X: PSingle; T, D, H, E, K: LongInt; SlotExpert: PLongInt; SlotGate: PSingle;
     WG: PByte; SG: PSingle; WU: PByte; SU: PSingle; WD: PByte; SD: PSingle; Y: PSingle): LongInt; cdecl;
   TCudaBench = function(N, K, Iters: LongInt; UsPerCall: PDouble): LongInt; cdecl;
+  TCudaBenchGemm = function(M, N, K, Warmup, Iters, Kind: LongInt; Us: PDouble): LongInt; cdecl;
+  TCudaInfo = function(Dev: LongInt; Buf: PChar; Len: LongInt): LongInt; cdecl;
+  // Opaque device-resident packed experts. H is written by Create.
+  TCudaResCreate = function(var H: Pointer; Experts, Dim, Hidden: LongInt;
+    WG: PByte; SG: PSingle; WU: PByte; SU: PSingle; WD: PByte; SD: PSingle): LongInt; cdecl;
+  TCudaResFwd = function(H: Pointer; X: PSingle; Tokens, TopK: LongInt;
+    SlotExpert: PLongInt; SlotGate, Y: PSingle): LongInt; cdecl;
+  TCudaResFree = procedure(H: Pointer); cdecl;
 
   TCudaApi = record
     Loaded: Boolean;
     Path: string;
     DeviceCount: TCudaInt;
     DeviceName: TCudaName;
+    DeviceInfo: TCudaInfo;
     LastError: TCudaErr;
     ActQuant: TCudaActQuant;
     Gemv: TCudaGemv;
     Gemm: TCudaGemm;
+    GemmNaive: TCudaGemm;
     MoeRouted: TCudaMoe;
     BenchGemv: TCudaBench;
+    BenchGemm: TCudaBenchGemm;
+    ResidentCreate: TCudaResCreate;
+    ResidentForward: TCudaResFwd;
+    ResidentDestroy: TCudaResFree;
   end;
 
 var
@@ -105,6 +119,13 @@ begin
     Pointer(Cuda.Gemm) := Sym('tmoe_h_ternary_gemm');
     Pointer(Cuda.MoeRouted) := Sym('tmoe_h_moe_routed_forward');
     Pointer(Cuda.BenchGemv) := Sym('tmoe_h_bench_gemv');
+    // Optional: an older library still answers the calls above.
+    Pointer(Cuda.GemmNaive) := GetProcedureAddress(Handle, 'tmoe_h_ternary_gemm_naive');
+    Pointer(Cuda.BenchGemm) := GetProcedureAddress(Handle, 'tmoe_h_bench_gemm');
+    Pointer(Cuda.DeviceInfo) := GetProcedureAddress(Handle, 'tmoe_cuda_device_info');
+    Pointer(Cuda.ResidentCreate) := GetProcedureAddress(Handle, 'tmoe_resident_create');
+    Pointer(Cuda.ResidentForward) := GetProcedureAddress(Handle, 'tmoe_resident_forward');
+    Pointer(Cuda.ResidentDestroy) := GetProcedureAddress(Handle, 'tmoe_resident_destroy');
   except
     on E: Exception do
     begin

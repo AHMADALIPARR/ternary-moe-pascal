@@ -48,7 +48,8 @@ var
   SE: TIntArray;
   BG, BU, BD: TByteArray;
   SG_, SU, SD, Gate: TSingleArray;
-  Shapes: array[0..2, 0..1] of Integer = ((64, 128), (300, 512), (1024, 2048));
+  Shapes: array[0..5, 0..1] of Integer = (
+    (1, 128), (33, 128), (65, 256), (64, 128), (300, 512), (1024, 2048));
   K: Integer;
 begin
   if not CudaAvailable(Why) then Skip('test_gpu', Why);
@@ -88,7 +89,24 @@ begin
     Rc := Cuda.Gemm(@M.Bits[0], @M.Scales[0], Rows, Cols, @Q[0], @Xs[0], T, @Y[0]);
     Check((Rc = 0) and (RelErr(@Y[0], @Yc[0], T * Rows) < 1e-5),
       Format('tiled GEMM (M=%d) vs CPU, rel err %.2e', [T, RelErr(@Y[0], @Yc[0], T * Rows)]));
+    if Assigned(Cuda.GemmNaive) then
+    begin
+      Rc := Cuda.GemmNaive(@M.Bits[0], @M.Scales[0], Rows, Cols, @Q[0], @Xs[0], T, @Y[0]);
+      Check((Rc = 0) and (RelErr(@Y[0], @Yc[0], T * Rows) < 1e-5),
+        Format('naive GEMM (no cross-token smem) vs CPU, rel err %.2e',
+          [RelErr(@Y[0], @Yc[0], T * Rows)]));
+    end;
   end;
+
+  Section('planted code 11');
+  RandomTernary(Rng, 40, 128, False, M);
+  M.Bits[0] := $FF;
+  SetLength(Q, 128); SetLength(Y, 40); SetLength(Yc, 40);
+  RandomInt8(Rng, 128, @Q[0]);
+  TernaryGemvInt8(M, @Q[0], 0.05, @Yc[0]);
+  Rc := Cuda.Gemv(@M.Bits[0], @M.Scales[0], 40, 128, @Q[0], 0.05, @Y[0]);
+  Check((Rc = 0) and (RelErr(@Y[0], @Yc[0], 40) < 1e-5),
+    Format('code 11 GEMV vs CPU, rel err %.2e', [RelErr(@Y[0], @Yc[0], 40)]));
 
   Section('grouped expert GEMM (routed MoE path)');
   C := TinyConfig;
@@ -123,5 +141,18 @@ begin
   // result still has to agree to well under a percent
   Check(RelErr(@Y[0], @Ref[0], T * C.Dim) < 1e-2,
     Format('GPU routed experts vs CPU, rel err %.2e', [RelErr(@Y[0], @Ref[0], T * C.Dim)]));
+
+  Section('MoeForward device path');
+  MoeSetDevice(False);
+  MoeForward(C, Md.Layers[0].Moe, @X[0], T, @Ref[0], R);
+  MoeSetDevice(True);
+  MoeReleaseDevice(Md.Layers[0].Moe);
+  FillZero(Y);
+  MoeForward(C, Md.Layers[0].Moe, @X[0], T, @Y[0], R);
+  Check(Md.Layers[0].Moe.Dev <> nil, 'resident experts uploaded for the layer');
+  Check(RelErr(@Y[0], @Ref[0], T * C.Dim) < 1e-3,
+    Format('MoeForward CUDA vs CPU, rel err %.2e', [RelErr(@Y[0], @Ref[0], T * C.Dim)]));
+  MoeSetDevice(False);
+  MoeReleaseDevice(Md.Layers[0].Moe);
   Finish('test_gpu');
 end.

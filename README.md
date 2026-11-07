@@ -3,7 +3,7 @@
 ![License](https://img.shields.io/badge/license-AGPL--3.0--only%20%7C%20SnapKitty--Opaque--1.0-blue)
 ![Free Pascal](https://img.shields.io/badge/Free%20Pascal-3.2%2B-orange)
 ![CUDA](https://img.shields.io/badge/CUDA-sm__80%20%7C%2086%20%7C%2087%20%7C%2089%20%7C%2090-76b900)
-![Tests](https://img.shields.io/badge/make%20test-8%20suites-brightgreen)
+![Tests](https://img.shields.io/badge/make%20test-CPU%20suites-brightgreen)
 
 A small decoder-only transformer whose feed-forward layers are a mixture of
 ternary experts, in the spirit of MoTE. Model, runtime and trainer are written in
@@ -27,7 +27,16 @@ block followed by one multiply by `w_scale * x_scale`. The GPU path does this
 with `dp4a` and keeps the weights packed in device memory.
 
 More detail: [docs/architecture.md](docs/architecture.md),
-[docs/kernels.md](docs/kernels.md), [docs/training.md](docs/training.md).
+[docs/kernels.md](docs/kernels.md), [docs/routing.md](docs/routing.md),
+[docs/orin-gemm.md](docs/orin-gemm.md), [docs/training.md](docs/training.md).
+
+The name is Free Pascal, not an NVIDIA Pascal GPU. CUDA builds target
+sm_80, sm_86, sm_87 (Jetson Orin), sm_89 and sm_90. The routed experts use
+the packed `dp4a` GEMM when `libtmoe_cuda.so` loads; `--cpu` keeps the CPU
+path, and a failed upload falls back to it. Orin SM count, DRAM bandwidth
+and clocks depend on the module and the nvpmodel. The cost model is
+`tmoe_cost`. It prints issued bytes and a labeled DRAM roof. It does not
+print measured cycles.
 
 ## Build and run
 
@@ -72,6 +81,25 @@ Ternary GEMV with INT8 activations, one call:
 | 4096x4096 | 4598.61 us | | |
 
 A routed expert in the small config is 432 KiB packed instead of 6 MiB in fp32.
+The blank GPU cells above are not measurements. Packing cuts the weight
+term from 4 bytes to 2 bits plus one fp32 scale per 128 columns; the tiled
+GEMM reuses each packed k-tile across 32 token rows and each activation
+tile across 64 output rows, so it issues fewer global loads than one warp
+per output. That is a reduction in
+issued traffic, not a claim that the load disappears or that a device was
+timed. See [docs/orin-gemm.md](docs/orin-gemm.md).
+
+```sh
+make test                 # CPU suites, tmoe_cost --check, tests/ref_ternary.py
+make cost                 # Orin parameter table and the static worked example
+make lib NVCC=/usr/local/cuda/bin/nvcc CUDA_ARCHS=87
+./build/bin/tmoe_bench --config small --warmup 10 --iters 50
+```
+
+`make test` does not run the GPU suite's kernels; `test_gpu` skips without
+a device. CUDA-event timings exist in `tmoe_bench` and run only when the
+library and a device are both present. No GPU timing is reported from a
+machine that has neither.
 
 ## Training
 
