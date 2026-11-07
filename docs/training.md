@@ -14,7 +14,11 @@ trains byte-level next-token prediction on a text file.
   with a straight-through gradient. This keeps the training forward identical
   to the packed inference path (`test_moe` checks they agree to 9.5e-7).
 * **Loss.** Mean cross-entropy over all positions plus the load-balance loss of
-  every MoE layer. Router gradients include both the gate path and the aux term.
+  every MoE layer. Router gradients include the gate path and the aux term.
+  The aux term differentiates the mean router probability only; the discrete
+  expert counts are constant. See [routing.md](routing.md). The SwiGLU
+  derivative is `sigmoid(x) * (1 + x * (1 - sigmoid(x)))`, with the same
+  `x < -80` cutoff as the forward SiLU.
 * **Optimiser.** AdamW (beta1 0.9, beta2 0.95, eps 1e-8, weight decay 0.01 on
   the attention, shared-expert, routed-expert and output matrices; none on
   the embedding, router or norms), global gradient-norm clipping at 1.0, linear warmup for 10

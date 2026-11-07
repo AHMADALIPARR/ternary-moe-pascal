@@ -1,9 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SnapKitty-Opaque-1.0
 // Copyright (C) 2026 Ahmad Ali Parr / SnapKitty Research Lab
 // Router: softmax over expert logits, top-k selection, per-expert capacity
-// and the Switch-style load-balance loss  L = a * E * sum_i f_i * P_i
-// (f_i = share of routed slots that picked expert i, P_i = mean router
-// probability of expert i). Backward helpers for the trainer live here too.
+// and the load-balance loss.
+//
+// Top-1 matches Switch Transformers (Fedus, Zoph, Shazeer, arXiv:2101.03961):
+//   f_i = (1/T) * |{tokens whose argmax is i}|     // discrete, PRE-drop
+//   P_i = (1/T) * sum_tokens p_i
+//   L   = alpha * N * sum_i f_i * P_i
+// f is a stop-gradient. Counts are not differentiated. Perfect balance gives
+// alpha; full collapse gives alpha * N.
+//
+// Top-k > 1 is NOT that formula. The generalization used here, and only here,
+// replaces the token argmax with the fraction of the T*K selected slots
+// (still pre-drop, still stop-gradient) and keeps P_i as the token-mean
+// probability. KeptFraction is the post-drop share and is not part of L:
+// using it would shrink the penalty when overflow drops the extra tokens.
 unit tmoe_router;
 
 {$mode objfpc}{$H+}
@@ -30,7 +41,13 @@ function ExpertCapacity(T, E, K: Integer; CapacityFactor: Single): Integer;
 procedure Route(Logits: PSingle; T, E, K: Integer; CapacityFactor: Single;
   Renorm: Boolean; out R: TRouting);
 function AuxLoss(const R: TRouting; Coef: Single): Single;
-// dProbs (T x E) += d(aux)/d(probs)
+// Pre-drop slot fraction (Switch f_i when K = 1). Zero when T = 0 or K = 0.
+function AssignFraction(const R: TRouting; Expert: Integer): Double;
+// Post-drop slot fraction. Not an input to AuxLoss.
+function KeptFraction(const R: TRouting; Expert: Integer): Double;
+// Token-mean router probability P_i. Zero when T = 0.
+function MeanProb(const R: TRouting; Expert: Integer): Double;
+// dProbs (T x E) += d(aux)/d(probs). f is held constant.
 procedure AuxLossBackward(const R: TRouting; Coef: Single; dProbs: PSingle);
 // dProbs row += d(gates)/d(probs) applied to dGate row
 procedure GateBackward(const R: TRouting; Tok: Integer; Renorm: Boolean; dGate, dProbs: PSingle);
@@ -72,12 +89,17 @@ var
 begin
   R.T := T; R.E := E; R.K := K;
   R.Probs := nil; R.Idx := nil; R.Gate := nil; R.Kept := nil; R.Counts := nil; R.Load := nil;
+  if T < 0 then T := 0;
+  if E < 0 then E := 0;
+  if K < 0 then K := 0;
+  R.T := T; R.E := E; R.K := K;
   SetLength(R.Probs, T * E);
   SetLength(R.Idx, T * K);
   SetLength(R.Gate, T * K);
   SetLength(R.Kept, T * K);
   SetLength(R.Counts, E);
   SetLength(R.Load, E);
+  if (T = 0) or (E = 0) or (K = 0) then Exit;
   Move(Logits^, R.Probs[0], T * E * SizeOf(Single));
   for I := 0 to T - 1 do
   begin
@@ -103,21 +125,36 @@ begin
     end;
 end;
 
+function AssignFraction(const R: TRouting; Expert: Integer): Double;
+begin
+  if (R.T <= 0) or (R.K <= 0) or (Expert < 0) or (Expert >= R.E) then Exit(0);
+  Result := R.Counts[Expert] / (Double(R.T) * R.K);
+end;
+
+function KeptFraction(const R: TRouting; Expert: Integer): Double;
+begin
+  if (R.T <= 0) or (R.K <= 0) or (Expert < 0) or (Expert >= R.E) then Exit(0);
+  Result := R.Load[Expert] / (Double(R.T) * R.K);
+end;
+
+function MeanProb(const R: TRouting; Expert: Integer): Double;
+var I: Integer;
+begin
+  if (R.T <= 0) or (Expert < 0) or (Expert >= R.E) then Exit(0);
+  Result := 0;
+  for I := 0 to R.T - 1 do Result := Result + R.Probs[I * R.E + Expert];
+  Result := Result / R.T;
+end;
+
 function AuxLoss(const R: TRouting; Coef: Single): Single;
 var
-  I, Ex: Integer;
-  F, P: Double;
+  Ex: Integer;
   S: Double;
 begin
+  if (R.T <= 0) or (R.K <= 0) or (R.E <= 0) then Exit(0);
   S := 0;
   for Ex := 0 to R.E - 1 do
-  begin
-    F := R.Counts[Ex] / (R.T * R.K);
-    P := 0;
-    for I := 0 to R.T - 1 do P := P + R.Probs[I * R.E + Ex];
-    P := P / R.T;
-    S := S + F * P;
-  end;
+    S := S + AssignFraction(R, Ex) * MeanProb(R, Ex);
   Result := Coef * R.E * S;
 end;
 
@@ -126,6 +163,10 @@ var
   I, Ex: Integer;
   G: Single;
 begin
+  if (R.T <= 0) or (R.K <= 0) or (R.E <= 0) then Exit;
+  // dL/dp_{t,e} = alpha * E * f_e / T, with f_e constant. Experts that
+  // received no assignment (f_e = 0) get no direct aux gradient; softmax
+  // couples the logits so mass still leaves the overloaded experts.
   for Ex := 0 to R.E - 1 do
   begin
     G := Coef * R.E * (R.Counts[Ex] / (R.T * R.K)) / R.T;

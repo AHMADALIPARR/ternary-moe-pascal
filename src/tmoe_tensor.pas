@@ -39,6 +39,9 @@ function RMSInv(X: PSingle; N: Integer; Eps: Single): Single;
 procedure SoftmaxInPlace(X: PSingle; N: Integer);
 function Silu(X: Single): Single; inline;
 function Sigmoid(X: Single): Single; inline;
+// d/dx [x * sigmoid(x)] = sigmoid(x) * (1 + x * (1 - sigmoid(x))).
+// Same cutoff as Sigmoid: x < -80 yields 0.
+function SiluDx(X: Single): Single; inline;
 procedure RopeNeox(V: PSingle; HeadDim, Pos: Integer; Theta: Single; Inverse: Boolean);
 
 procedure FillZero(var A: TSingleArray);
@@ -209,6 +212,13 @@ function Silu(X: Single): Single; inline;
 begin
   if X < -80 then Exit(0);
   Result := X / (1.0 + Exp(-X));
+end;
+
+function SiluDx(X: Single): Single; inline;
+var S: Single;
+begin
+  S := Sigmoid(X);
+  Result := S * (1 + X * (1 - S));
 end;
 
 // NEOX-style rotary embedding: element i pairs with element i + HeadDim/2.

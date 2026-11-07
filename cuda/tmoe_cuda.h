@@ -68,8 +68,30 @@ int tmoe_h_moe_routed_forward(const float* x, int tokens, int dim, int hidden, i
                               const uint8_t* wg, const float* sg,
                               const uint8_t* wu, const float* su,
                               const uint8_t* wd, const float* sd, float* y);
+// Same math as tmoe_h_ternary_gemm, one warp per output, no cross-token smem reuse.
+// Baseline for the tiled kernel. Not a cuBLAS call.
+int tmoe_h_ternary_gemm_naive(const uint8_t* w, const float* ws, int n, int k,
+                              const int8_t* xq, const float* xs, int m, float* y);
 // Times `iters` decode GEMVs on resident weights; returns microseconds per call.
 int tmoe_h_bench_gemv(int n, int k, int iters, double* us_per_call);
+// kind 0 = tiled GEMM (one launch), kind 1 = naive GEMM (one launch, no
+// cross-token smem reuse). warmup launches are not timed. CUDA events.
+// *us is microseconds per launch. Does not report bandwidth.
+int tmoe_h_bench_gemm(int m, int n, int k, int warmup, int iters, int kind, double* us);
+
+// Packed experts kept on device. x/y/routing stay host pointers; y is updated
+// in place (shared-expert output in, routed sum added). NULL on failure.
+typedef struct tmoe_resident tmoe_resident;
+int tmoe_resident_create(tmoe_resident** out, int experts, int dim, int hidden,
+                         const uint8_t* wg, const float* sg, const uint8_t* wu, const float* su,
+                         const uint8_t* wd, const float* sd);
+int tmoe_resident_forward(tmoe_resident* res, const float* x, int tokens, int topk,
+                          const int* slot_expert, const float* slot_gate, float* y);
+void tmoe_resident_destroy(tmoe_resident* res);
+
+// One line: name, CC, SM count, clocks, bus, L2, register file, smem.
+// Clocks are whatever the driver reports right now (power-mode dependent).
+int tmoe_cuda_device_info(int dev, char* buf, int len);
 
 #ifdef __cplusplus
 }

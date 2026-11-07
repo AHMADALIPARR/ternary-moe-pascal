@@ -30,10 +30,22 @@ packed weights (`k/4` bytes) plus scales (`k/32` bytes).
 
 Output tile 32 tokens x 64 rows, k-tile 128 (exactly one scale block), 256
 threads, each thread computing 2 x 4 outputs. Per k-tile the block loads
-32 x 128 activation bytes and 64 x 32 packed bytes, expands the weights through
-the table into a padded `[64][33]` shared array (the extra column avoids bank
-conflicts), runs 32 `dp4a` steps per output and folds the int32 result into fp32
-with the block scale. The token scale is applied in the epilogue.
+32 x 128 activation bytes as 16-byte `int4`s (one per thread) and 64 x 32
+packed weight bytes as 16-byte `uint4`s (two per row, threads 0..127). Each
+row's 32 packed bytes fill one 32-byte sector. Rows are `K/4` bytes apart, so
+a warp does not merge them into one transaction unless `K = 128`. The weights
+are expanded through the LUT into a padded `[64][33]` shared array (the extra
+column avoids bank conflicts on the `dp4a` reads), the block runs 32 `dp4a`
+steps per output and folds the int32 result into fp32 with the block scale.
+The token scale is applied in the epilogue. Tail rows and columns are
+predicated: invalid weight rows are not loaded.
+
+`ternary_gemm_naive_kernel` is the single-launch baseline: one warp per output
+row per token, same int32 block sum, no cross-token shared-memory reuse.
+`tmoe_h_bench_gemm` times both with CUDA events. Neither kernel calls cuBLAS.
+
+Tile sizes, bank map, issued bytes and the Orin parameter table are in
+[orin-gemm.md](orin-gemm.md). That document does not report measured cycles.
 
 The same kernel, compiled with `GROUPED = true`, is the grouped expert GEMM:
 `blockIdx.z` selects the expert, tile rows are read through the permutation
@@ -54,6 +66,13 @@ produced by the dispatch step, and results are scattered back to slot order.
    result does not depend on the scatter order.
 
 The workspace size comes from `tmoe_moe_workspace_bytes`.
+
+`MoeForward` keeps that math on the CPU unless `MoeSetDevice(True)` was
+called. `tmoe_generate` and `tmoe_bench` do so unless `--cpu`. The device
+path uploads the layer's packed experts once (`tmoe_resident_create`) and
+adds the routed sum into `y`, which already holds the shared expert. A
+missing library or a failed upload or launch falls back to the CPU loop.
+`ActQuant` off stays on the CPU: the GPU path always quantises to int8.
 
 ## INT8 activation quantisation
 
@@ -80,8 +99,13 @@ spill/stack summary.
 
 ## ptxas report
 
-nvcc 12.9, all five architectures. Every kernel on every architecture reports
-`0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`.
+The table below is the nvcc 12.9 report for the kernels as they stood before
+the 16-byte weight load. It was not regenerated for the current source: this
+tree was built without nvcc. Run `make lib` and read `build/ptxas.log` before
+treating register counts as current. Do not use them for occupancy until then.
+
+Historical nvcc 12.9 note: every kernel on every architecture in that log
+reported `0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads`.
 
 | Kernel | sm_80 | sm_86 | sm_87 | sm_89 | sm_90 | shared mem |
 |---|---|---|---|---|---|---|

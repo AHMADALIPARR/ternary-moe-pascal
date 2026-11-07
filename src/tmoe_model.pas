@@ -76,6 +76,7 @@ begin
       ShUp := @Store.Data[Lo.ShUp];
       ShDown := @Store.Data[Lo.ShDown];
       Router := @Store.Data[Lo.Router];
+      Dev := nil;
       SetLength(ExGate, C.Experts);
       SetLength(ExUp, C.Experts);
       SetLength(ExDown, C.Experts);
