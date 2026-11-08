@@ -44,7 +44,8 @@ The `main` currently verifies:
 - packing of the sum,
 - a single push/pop on the ring buffer,
 - that two elements of S₃ do not commute,
-- stress case for 10¹⁸ (round-trip, double via addition, multiply by 3, pack).
+- stress case for 10¹⁸ (round-trip, double via addition, multiply by 3, pack),
+- stress case for 10³⁰ (beyond int64; built from decimal string and as 1·10³⁰, compared, doubled, packed).
 
 ## Formal verification obligations (for a Lean 4 development)
 

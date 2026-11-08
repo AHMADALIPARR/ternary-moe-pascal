@@ -355,6 +355,49 @@ static int permutation_equal(
     return 1;
 }
 
+/* Build a Ternary from a non-negative decimal string.
+ * Uses the existing add/mul engine: result = 0; for each digit: result = result*10 + d.
+ */
+static Status ternary_from_dec(
+    const char *dec,
+    Ternary *out
+) {
+    if (!dec || !out) return ERR_RANGE;
+
+    Ternary acc, ten, digit, tmp;
+    Status s = ternary_zero(&acc);
+    if (s != OK) return s;
+
+    s = ternary_from_i64(10, &ten);
+    if (s != OK) return s;
+
+    for (const char *p = dec; *p; p++) {
+        if (*p < '0' || *p > '9') return ERR_RANGE;
+        int d = *p - '0';
+
+        s = ternary_mul(&acc, &ten, &tmp);
+        if (s != OK) return s;
+        acc = tmp;
+
+        s = ternary_from_i64(d, &digit);
+        if (s != OK) return s;
+
+        s = ternary_add(&acc, &digit, &tmp);
+        if (s != OK) return s;
+        acc = tmp;
+    }
+
+    *out = acc;
+    return OK;
+}
+
+static int ternary_equal(const Ternary *a, const Ternary *b) {
+    if (!a || !b || a->length != b->length) return 0;
+    for (uint32_t i = 0; i < a->length; i++)
+        if (a->digits[i] != b->digits[i]) return 0;
+    return 1;
+}
+
 int main(void) {
     Ternary a, b, sum, product;
     uint8_t encoded[32];
@@ -447,6 +490,43 @@ int main(void) {
         uint32_t packed_bytes;
         if (pack_trits(&big, packed, sizeof(packed), &packed_bytes) != OK)
             return 12;
+    }
+
+    /* Stress test: 10^30 (beyond int64). Built two ways and compared. */
+    {
+        const char *DEC30 = "1000000000000000000000000000000"; /* 1e30 */
+        Ternary from_str, from_pow, one, ten, tmp;
+
+        if (ternary_from_dec(DEC30, &from_str) != OK)
+            return 13;
+
+        /* Build the same value as 1 * 10^30. */
+        if (ternary_from_i64(1, &one) != OK) return 13;
+        if (ternary_from_i64(10, &ten) != OK) return 13;
+        from_pow = one;
+        for (int i = 0; i < 30; i++) {
+            if (ternary_mul(&from_pow, &ten, &tmp) != OK) return 13;
+            from_pow = tmp;
+        }
+
+        if (!ternary_equal(&from_str, &from_pow))
+            return 13;
+
+        /* Double it and pack. */
+        Ternary doubled;
+        if (ternary_add(&from_str, &from_str, &doubled) != OK)
+            return 13;
+
+        uint8_t packed30[128];
+        uint32_t n30;
+        if (pack_trits(&from_str, packed30, sizeof(packed30), &n30) != OK)
+            return 13;
+        if (pack_trits(&doubled, packed30, sizeof(packed30), &n30) != OK)
+            return 13;
+
+        /* Length must be in the expected ballpark for 10^30 (~63 trits). */
+        if (from_str.length < 50 || from_str.length > 80)
+            return 13;
     }
 
     return 0;
