@@ -27,6 +27,7 @@ This directory contains an independent C reference / stress harness for balanced
 | `Ring.read/write`   | Consumer / producer index | Modulo 64                     |
 | `Permutation.p`     | Three-element permutation | Elements 0–2                  |
 | `pack_trits`        | Compact serializer        | Five trits per byte (3⁵=243)  |
+| `ternary_to_i64`    | Decoding oracle           | Balanced ternary → int64      |
 
 ## Build & run
 
@@ -38,7 +39,8 @@ cc -std=c11 -Wall -Wextra -o ternary_omega ternary_omega.c
 The `main` currently verifies:
 
 - conversion of 42 and −17,
-- addition and multiplication (results not yet decoded by an oracle),
+- addition (decoding oracle confirms result = 25),
+- multiplication (decoding oracle confirms result = −714),
 - packing of the sum,
 - a single push/pop on the ring buffer,
 - that two elements of S₃ do not commute.

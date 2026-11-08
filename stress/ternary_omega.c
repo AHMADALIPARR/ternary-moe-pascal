@@ -116,6 +116,34 @@ static Status ternary_from_i64(
     return OK;
 }
 
+/* Decoding oracle: evaluate balanced ternary to int64.
+ * Returns ERR_RANGE if any digit is out of {-1,0,1} or the value
+ * does not fit in int64. */
+static Status ternary_to_i64(
+    const Ternary *x,
+    int64_t *out
+) {
+    if (!x || !out || !x->digits) return ERR_RANGE;
+
+    int64_t value = 0;
+    int64_t place = 1;
+
+    for (uint32_t i = 0; i < x->length; i++) {
+        int8_t d = x->digits[i];
+        if (d < -1 || d > 1) return ERR_RANGE;
+
+        /* Detect overflow before multiplying place further. */
+        if (i > 0 && place > INT64_MAX / 3) return ERR_RANGE;
+
+        value += (int64_t)d * place;
+        if (i + 1 < x->length)
+            place *= 3;
+    }
+
+    *out = value;
+    return OK;
+}
+
 static Status ternary_add(
     const Ternary *a,
     const Ternary *b,
@@ -331,6 +359,7 @@ int main(void) {
     Ternary a, b, sum, product;
     uint8_t encoded[32];
     uint32_t bytes;
+    int64_t decoded;
 
     if (ternary_from_i64(42, &a) != OK)
         return 1;
@@ -341,7 +370,15 @@ int main(void) {
     if (ternary_add(&a, &b, &sum) != OK)
         return 3;
 
+    /* Decoding oracle: 42 + (-17) must equal 25. */
+    if (ternary_to_i64(&sum, &decoded) != OK || decoded != 25)
+        return 3;
+
     if (ternary_mul(&a, &b, &product) != OK)
+        return 4;
+
+    /* Decoding oracle: 42 * (-17) must equal -714. */
+    if (ternary_to_i64(&product, &decoded) != OK || decoded != -714)
         return 4;
 
     if (pack_trits(&sum, encoded,
@@ -371,14 +408,9 @@ int main(void) {
     if (permutation_compose(&q, &p, &qp) != OK)
         return 10;
 
-    // Verify these permutations do not commute.
+    /* Verify these permutations do not commute. */
     if (permutation_equal(&pq, &qp))
         return 11;
-
-    // 42 + (-17) = 25.
-    // 42 * (-17) = -714.
-    // These arithmetic results are not yet
-    // checked by a decoding oracle.
 
     return 0;
 }
