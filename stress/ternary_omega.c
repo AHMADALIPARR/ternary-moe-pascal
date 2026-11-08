@@ -412,5 +412,42 @@ int main(void) {
     if (permutation_equal(&pq, &qp))
         return 11;
 
+    /* Stress test: 10^18 round-trip and simple arithmetic. */
+    {
+        const int64_t BIG = 1000000000000000000LL; /* 1e18 */
+        Ternary big, big2, sum_big, prod_small;
+        int64_t decoded_big;
+
+        if (ternary_from_i64(BIG, &big) != OK)
+            return 12;
+
+        if (ternary_to_i64(&big, &decoded_big) != OK || decoded_big != BIG)
+            return 12;
+
+        /* Double it via addition. */
+        if (ternary_add(&big, &big, &sum_big) != OK)
+            return 12;
+
+        if (ternary_to_i64(&sum_big, &decoded_big) != OK || decoded_big != 2 * BIG)
+            return 12;
+
+        /* Multiply by a small constant (3). */
+        Ternary three;
+        if (ternary_from_i64(3, &three) != OK)
+            return 12;
+
+        if (ternary_mul(&big, &three, &prod_small) != OK)
+            return 12;
+
+        if (ternary_to_i64(&prod_small, &decoded_big) != OK || decoded_big != 3 * BIG)
+            return 12;
+
+        /* Also exercise the packer on the large value. */
+        uint8_t packed[64];
+        uint32_t packed_bytes;
+        if (pack_trits(&big, packed, sizeof(packed), &packed_bytes) != OK)
+            return 12;
+    }
+
     return 0;
 }

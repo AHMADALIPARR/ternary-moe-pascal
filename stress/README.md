@@ -43,7 +43,8 @@ The `main` currently verifies:
 - multiplication (decoding oracle confirms result = −714),
 - packing of the sum,
 - a single push/pop on the ring buffer,
-- that two elements of S₃ do not commute.
+- that two elements of S₃ do not commute,
+- stress case for 10¹⁸ (round-trip, double via addition, multiply by 3, pack).
 
 ## Formal verification obligations (for a Lean 4 development)
 
